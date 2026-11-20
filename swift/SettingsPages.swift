@@ -58,6 +58,21 @@ struct DictationPage: View {
     var body: some View {
         let app = model.app
         VStack(spacing: 18) {
+            SettingsCard {
+                SettingsRow(icon: "globe", color: sys(.systemBlue),
+                            title: L("Язык диктовки", "Dictation Language"),
+                            subtitle: L("Русский — модель v3. Қазақша — GigaAM Multilingual; знаки ставятся по правилам. Пока идёт запись, язык не меняется.",
+                                        "Russian uses v3. Қазақша uses GigaAM Multilingual with rule-based punctuation. The language does not switch while recording.")) {
+                    Picker("", selection: Binding(
+                        get: { SpeechLang.current },
+                        set: { lang in model.act { app.selectSpeechLang(lang) } })) {
+                        Text(L("Русский", "Russian")).tag(SpeechLang.ru)
+                        Text("Қазақша").tag(SpeechLang.kk)
+                    }
+                    .labelsHidden().fixedSize()
+                }
+            }
+
             // Сцена — отдельной карточкой без заголовка: она не настройка,
             // а картинка к ней.
             SettingsCard {

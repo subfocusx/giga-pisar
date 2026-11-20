@@ -24,13 +24,14 @@ var uiIsRussian: Bool {
 func L(_ ru: String, _ en: String) -> String { uiIsRussian ? ru : en }
 
 // Где искать файлы модели. Сначала внутри самого приложения — так его можно
-// отдать человеку одним куском; потом обычные места на диске.
-func findModelDir() -> String? {
+// отдать человеку одним куском; потом обычные места на диске. У каждого
+// языка своя папка и свой файл-признак: русская в model, казахская в model-kk.
+func findModelDir(_ lang: SpeechLang = .current) -> String? {
     var places: [String] = []
-    if let res = Bundle.main.resourcePath { places.append(res + "/model") }
-    places.append("\(NSHomeDirectory())/.giga/model")
+    if let res = Bundle.main.resourcePath { places.append(res + "/" + lang.folder) }
+    places.append("\(NSHomeDirectory())/.giga/\(lang.folder)")
     for dir in places
-    where FileManager.default.fileExists(atPath: "\(dir)/\(Recognizer.modelName).yaml") {
+    where FileManager.default.fileExists(atPath: "\(dir)/\(lang.modelFile)") {
         return dir
     }
     return nil
@@ -163,10 +164,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
     private var setupPoll: Timer?
 
     /// Модель. Грузится в фоне при запуске и заново после выгрузки;
-    /// recognizer трогаем только из recognizerQueue.
-    var recognizer: Recognizer?
+    /// recognizer трогаем только из recognizerQueue. Тип общий: русская
+    /// модель и казахская CTC отвечают на один и тот же transcribe.
+    var recognizer: SpeechRecognizer?
     let recognizerQueue = DispatchQueue(label: "ru.panda.giga.recognizer")
     private var modelUnload: DispatchWorkItem? // recognizerQueue only
+    /// Идёт загрузка/смена модели; язык в это время не переключаем.
+    private(set) var modelLoading = false // main queue
     private var memoryPressure: DispatchSourceMemoryPressure?
     private let dictionary = DictionaryStore() // recognizerQueue only
     private var pendingOperations = 0 // main queue; includes older takes and Brain
@@ -657,6 +661,41 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
         settings.refresh()
     }
 
+    /// Русский ⇄ казахский из настроек и знакомства. Пока идёт запись или
+    /// качается/грузится модель, язык не меняем: иначе текущая диктовка
+    /// уйдёт не в ту модель.
+    func selectSpeechLang(_ lang: SpeechLang) {
+        guard lang != SpeechLang.current else {
+            if findModelDir(lang) == nil, modelDL == nil, !modelLoading { downloadSpeechModel() }
+            return
+        }
+        guard !mic.isRecording, state != .rec, recordingContext == nil,
+              modelDL == nil, !modelLoading else {
+            Toast.shared.show(L("Сначала закончи диктовку и дождись модели — потом меняй язык",
+                                "Finish the dictation and wait for the model, then change the language"))
+            setup.state.speechLang = SpeechLang.current
+            settingsChanged()
+            return
+        }
+        SpeechLang.current = lang
+        setup.state.speechLang = lang
+        setup.state.ready = findModelDir(lang) != nil
+        setup.state.progress = 0
+        setup.state.done = 0
+        setup.state.total = 0
+        setup.state.failed = false
+        setup.state.note = ""
+        if findModelDir(lang) != nil {
+            loadModel()
+            Toast.shared.show(lang == .kk
+                              ? L("Диктовка по-казахски", "Dictating in Kazakh")
+                              : L("Диктовка по-русски", "Dictating in Russian"))
+        } else {
+            complainNoModel()
+        }
+        settingsChanged()
+    }
+
     lazy var settings = SettingsWindow(app: self)
 
     @objc func openSettings() { settings.show() }
@@ -986,6 +1025,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
         s.done = 0
         s.total = 0
         s.ready = findModelDir() != nil
+        s.speechLang = SpeechLang.current
         s.micGranted = Access.micGranted
         s.micDenied = micRefused
         s.axGranted = Access.axGranted
@@ -1002,6 +1042,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
         s.askAX = { [weak self] in self?.setupAskAX() }
         s.pickHotkey = { [weak self] id in self?.selectHotkey(id) }
         s.pickWave = { [weak self] id in self?.selectWave(id) }
+        s.pickSpeechLang = { [weak self] lang in
+            guard let self else { return }
+            self.selectSpeechLang(lang)
+            if self.setupRunning, !self.setup.state.ready, self.modelDL == nil {
+                self.downloadSpeechModel()
+            }
+        }
         s.finish = { [weak self] in self?.finishSetup() }
         s.openBrain = { [weak self] in
             self?.finishSetup()
@@ -1010,8 +1057,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
         setupRunning = true
         setup.show(closable: closable)
         // Модель качаем только в полном знакомстве: когда пришли из-за
-        // доступа, она давно на месте.
-        if steps.contains(.welcome), !s.ready, modelDL == nil { downloadSpeechModel() }
+        // доступа, она давно на месте. Если первым идёт выбор языка, ждём
+        // его: иначе русская модель начнёт качаться до выбора казахской.
+        if steps.contains(.welcome), steps.first != .language, !s.ready, modelDL == nil {
+            downloadSpeechModel()
+        }
         // Универсальный доступ система выдаёт молча: узнать о нём можно
         // только спрашивая. Микрофон заодно — его могли выдать в обход.
         setupPoll?.invalidate()
@@ -1098,30 +1148,85 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
     // MARK: сервер
 
     func loadModel() {
-        guard let dir = findModelDir() else {
-            DispatchQueue.main.async { [weak self] in self?.complainNoModel() }
-            return
-        }
+        let lang = SpeechLang.current
+        modelLoading = true
         recognizerQueue.async { [weak self] in
+            guard let self else { return }
+            // Прежнюю модель отпускаем сразу: иначе при смене языка русская
+            // осталась бы в памяти под казахским и слушала бы не тем ухом.
+            self.recognizer = nil
+            self.modelUnload?.cancel()
+            guard let dir = findModelDir(lang) else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.modelLoading = false
+                    self.complainNoModel()
+                }
+                return
+            }
             do {
-                self?.recognizer = try Recognizer(modelDir: dir)
-                self?.scheduleModelUnload()
+                self.recognizer = try Self.makeRecognizer(lang, dir: dir)
+                self.scheduleModelUnload()
+                DispatchQueue.main.async { self.modelLoading = false }
             } catch {
                 NSLog("Гига Писарь: модель не загрузилась — \(error)")
-                DispatchQueue.main.async { self?.complainNoModel() }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.modelLoading = false
+                    self.rollbackToRussian(reason: L("казахская модель не загрузилась",
+                                                     "the Kazakh model did not load"))
+                }
             }
+        }
+    }
+
+    /// Русская модель — Recognizer, казахская — CTC. Одна точка выбора,
+    /// чтобы загрузка, ленивый подъём и выгрузка не разъехались.
+    private static func makeRecognizer(_ lang: SpeechLang, dir: String) throws -> SpeechRecognizer {
+        switch lang {
+        case .ru: return try Recognizer(modelDir: dir)
+        case .kk: return try CTCRecognizer(modelDir: dir)
         }
     }
 
     /// Модель перед распознаванием: после выгрузки её в памяти нет.
     /// Отказ не поднимает окно про скачивание: файлы могут быть на месте,
     /// а человек в этот момент диктует. recognizerQueue only.
-    private func loadedRecognizer() -> Recognizer? {
-        if recognizer == nil, let dir = findModelDir() {
-            do { recognizer = try Recognizer(modelDir: dir) }
-            catch { NSLog("Гига Писарь: модель не загрузилась — \(error)") }
+    private func loadedRecognizer() -> SpeechRecognizer? {
+        let lang = SpeechLang.current
+        if recognizer == nil, let dir = findModelDir(lang) {
+            do {
+                recognizer = try Self.makeRecognizer(lang, dir: dir)
+                scheduleModelUnload()
+            } catch {
+                NSLog("Гига Писарь: модель не загрузилась — \(error)")
+                if lang == .kk {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.rollbackToRussian(reason: L("казахская модель не загрузилась",
+                                                          "the Kazakh model did not load"))
+                    }
+                }
+            }
         }
         return recognizer
+    }
+
+    /// Любая неудача казахской модели возвращает русскую: без «ушей» Писарь
+    /// молчит, а русская модель обычно уже лежит рядом.
+    func rollbackToRussian(reason: String) {
+        guard SpeechLang.current == .kk else { return }
+        recognizerQueue.async { [weak self] in self?.recognizer = nil }
+        guard findModelDir(.ru) != nil else {
+            Toast.shared.show(L("Казахская модель не готова (\(reason)). Русской модели тоже нет — скачать её можно в настройках.",
+                                "The Kazakh model is not ready (\(reason)). There is no Russian model either — you can download it in Settings."))
+            return
+        }
+        SpeechLang.current = .ru
+        if setup.state.speechLang != .ru { setup.state.speechLang = .ru }
+        settingsChanged()
+        loadModel()
+        Toast.shared.show(L("Казахская модель не готова (\(reason)) — вернулся на русский",
+                            "The Kazakh model is not ready (\(reason)) — switched back to Russian"))
     }
 
     /// Выгружать ли модель при простое и нехватке памяти. Off by default.
@@ -1173,14 +1278,23 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
     func complainNoModel() {
         // Во время знакомства про это написано прямо в окне.
         guard !setupRunning else { return }
+        let lang = SpeechLang.current
         let a = NSAlert()
-        a.messageText = L("Остался один шаг — модель распознавания",
-                          "One last piece — the speech model")
-        a.informativeText = L("Это «уши» Писаря: 204 МБ, качается один раз и переживает все обновления. Ход дела будет виден в отдельном окне.",
-                              "Pisar's ears: a one-time 204 MB download that survives every update. Progress shows in its own window.")
+        if lang == .kk {
+            a.messageText = L("Нужна казахская модель распознавания", "The Kazakh speech model is needed")
+        } else {
+            a.messageText = L("Остался один шаг — модель распознавания",
+                              "One last piece — the speech model")
+        }
+        a.informativeText = L("Это «уши» Писаря: \(lang.downloadMB) МБ, качается один раз и переживает все обновления. Ход дела будет виден в отдельном окне.",
+                              "Pisar's ears: a one-time \(lang.downloadMB) MB download that survives every update. Progress shows in its own window.")
         a.addButton(withTitle: L("Скачать", "Download"))
         a.addButton(withTitle: L("Позже", "Later"))
-        guard a.runModal() == .alertFirstButtonReturn else { return }
+        guard a.runModal() == .alertFirstButtonReturn else {
+            // Отказались от казахской — не оставляем Писаря глухим: назад на русский.
+            if lang == .kk { rollbackToRussian(reason: L("модель не скачана", "the model was not downloaded")) }
+            return
+        }
         downloadSpeechModel()
     }
 
@@ -1188,13 +1302,15 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
 
     func downloadSpeechModel() {
         guard modelDL == nil else { return }
-        let url = URL(string: "https://github.com/moznoazachem/giga-pisar-cli/releases/download/v1.0/gigaam-v3-onnx-int8.tar.gz")!
+        let lang = SpeechLang.current
+        let url = lang.downloadURL
         // Раньше проценты дописывались к значку в строке меню, значок
         // раздувался и на маках с чёлкой прятался за ней: «поставил, а
         // значка нет». Теперь окно с полоской, значок не трогаем.
         modelWindow.onCancel = { [weak self] in
             self?.modelDL?.cancel()
             self?.modelDL = nil
+            if lang == .kk { self?.rollbackToRussian(reason: L("загрузка отменена", "the download was canceled")) }
         }
         if !setupShowsProgress {
             modelWindow.show(title: L("Модель распознавания", "Speech model"))
@@ -1214,13 +1330,15 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
                         self.setup.state.failed = true
                         self.setup.state.note = L("Не скачалась (\(error ?? "сеть"))",
                                                   "Download failed (\(error ?? "network"))")
+                        if lang == .kk { self.rollbackToRussian(reason: L("модель не скачалась", "the model did not download")) }
                         return
                     }
                     Toast.shared.show(L("Модель не скачалась (\(error ?? "сеть")) — попробуй позже, окно появится снова при запуске",
                                         "Model download failed (\(error ?? "network")) — try again later, the prompt returns on launch"))
+                    if lang == .kk { self.rollbackToRussian(reason: L("модель не скачалась", "the model did not download")) }
                     return
                 }
-                self.unpackSpeechModel(file)
+                self.unpackSpeechModel(file, lang: lang)
             }
         })
         modelDL?.onBytes = { [weak self] done, total in
@@ -1236,7 +1354,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
         modelDL?.download(url)
     }
 
-    private func unpackSpeechModel(_ file: URL) {
+    private func unpackSpeechModel(_ file: URL, lang: SpeechLang) {
         modelWindow.onCancel = nil
         if setupShowsProgress {
             setup.state.note = L("Распаковываю…", "Unpacking…")
@@ -1244,14 +1362,20 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
             modelWindow.busy(L("Распаковываю…", "Unpacking…"))
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let dest = NSHomeDirectory() + "/.giga/model"
-            // The same tarball as on GitHub (its own digest says so); anything else is not unpacked.
-            guard sha256Hex(ofFile: file.path) == "e5a75ab56ab6d3f3a70ab17dd1ce858fe8180597963839dc806014447483224c" else {
+            let dest = NSHomeDirectory() + "/.giga/" + lang.folder
+            // The same tarball as in the release (its own digest says so); anything else is not unpacked.
+            guard sha256Hex(ofFile: file.path) == lang.archiveSHA256 else {
                 try? FileManager.default.removeItem(at: file)
                 DispatchQueue.main.async {
-                    self?.modelWindow.hide()
+                    guard let self else { return }
+                    self.modelWindow.hide()
+                    if self.setupShowsProgress {
+                        self.setup.state.failed = true
+                        self.setup.state.note = L("Модель скачалась повреждённой", "The model arrived damaged")
+                    }
                     Toast.shared.show(L("Модель скачалась повреждённой, попробуй ещё раз",
                                         "The model arrived damaged, try again"))
+                    if lang == .kk { self.rollbackToRussian(reason: L("неверная sha256 архива", "wrong archive sha256")) }
                 }
                 return
             }
@@ -1263,7 +1387,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
             do {
                 try tar.run()
                 tar.waitUntilExit()
-                ok = tar.terminationStatus == 0 && findModelDir() != nil
+                ok = tar.terminationStatus == 0 && findModelDir(lang) != nil
             } catch {}
             try? FileManager.default.removeItem(at: file)
             DispatchQueue.main.async {
@@ -1278,12 +1402,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
                         Toast.shared.show(L("Модель на месте — зажимай \(currentHotkey().title) и диктуй!",
                                             "Model is in — hold \(currentHotkey().title) and dictate!"))
                     }
-                } else if self.setupShowsProgress {
-                    self.setup.state.failed = true
-                    self.setup.state.note = L("Архив не распаковался", "Could not unpack")
                 } else {
+                    if self.setupShowsProgress {
+                        self.setup.state.failed = true
+                        self.setup.state.note = L("Архив не распаковался", "Could not unpack")
+                    }
                     Toast.shared.show(L("Архив модели не распаковался — попробуй ещё раз",
                                         "Couldn't unpack the model — try again"))
+                    if lang == .kk { self.rollbackToRussian(reason: L("архив не распаковался", "the archive did not unpack")) }
                 }
             }
         }
@@ -2005,7 +2131,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
                 if self.runSelectionCommand(text) { return }
                 // Keep raw text available in the menu even if Brain/clipboard stalls.
                 // Обращение «Писарь, …» в конце? Сперва текст идёт в мозг.
-                if let (body, cmd) = Brain.parseCommand(text) {
+                if SpeechLang.current == .ru, let (body, cmd) = Brain.parseCommand(text) {
                     guard Brain.shared.ready else {
                         self.setState(.idle)
                         self.paste(text, simplify: true)
@@ -2036,7 +2162,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDe
                     return
                 }
                 // "Edit every take": no address needed, the whole take goes through the Brain.
-                if Brain.shared.everyTake, Brain.shared.ready {
+                if SpeechLang.current == .ru, Brain.shared.everyTake, Brain.shared.ready {
                     self.pendingOperations += 1
                     Brain.shared.transform(text, command: "исправь") { out in
                         DispatchQueue.main.async {

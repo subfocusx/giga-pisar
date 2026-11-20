@@ -36,6 +36,7 @@ enum Access {
 }
 
 enum SetupStep: Int, CaseIterable {
+    case language       // на каком языке диктовать: русский или казахский
     case welcome        // знакомство: знак, название и загрузка модели
     case microphone     // доступ к микрофону
     case accessibility  // универсальный доступ: им Писарь вставляет текст
@@ -63,6 +64,11 @@ final class SetupState: ObservableObject {
     /// Куда сообщить о выборе. В приложении — в настройки, в
     /// предпросмотре никуда.
     var pickHotkey: (String) -> Void = { _ in }
+
+    /// Язык диктовки: русский или казахский. От него зависит, какую
+    /// модель качать и каким ухом слушать.
+    @Published var speechLang = SpeechLang.current
+    var pickSpeechLang: (SpeechLang) -> Void = { _ in }
 
     /// Где показывать волну голоса: «cursor» или «bottom».
     @Published var waveChoice = "cursor"
@@ -275,6 +281,7 @@ struct SetupView: View {
     @ViewBuilder
     private func content(for step: SetupStep) -> some View {
         switch step {
+        case .language:      languageContent
         case .welcome:       welcomeContent
         case .microphone:    microphoneContent
         case .accessibility: accessibilityContent
@@ -319,6 +326,25 @@ struct SetupView: View {
     /// и взгляд её не ищет.
     private var buttonCenter: CGPoint {
         CGPoint(x: Self.size.width / 2, y: Self.size.height - Self.footer / 2)
+    }
+
+    /// Первый шаг: на каком языке диктовать. Русская модель уже у многих
+    /// стоит; казахская скачается сама, если её выбрать.
+    private var languageContent: some View {
+        stage(title: L("На каком языке диктовать?", "Which language do you dictate in?"),
+              text: L("Можно поменять позже в настройках, раздел «Диктовка».\nПока идёт запись, язык не переключается.",
+                      "You can change it later in Settings, Dictation.\nThe language does not switch while you are recording.")) {
+            SetupBadge(icon: "globe", color: Color(nsColor: .systemBlue), granted: false)
+        } content: {
+            Picker("", selection: Binding(get: { state.speechLang },
+                                          set: { state.pickSpeechLang($0) })) {
+                Text(L("Русский", "Russian")).tag(SpeechLang.ru)
+                Text("Қазақша").tag(SpeechLang.kk)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 320)
+        }
     }
 
     /// Первый шаг: знак и подписи над полоской.
@@ -637,7 +663,11 @@ struct SetupView: View {
             switch asks {
             case .microphone:    state.askMic()
             case .accessibility: state.askAX()
-            default: withAnimation(.easeInOut(duration: 0.26)) { state.next() }
+            default:
+                // На шаге языка «Продолжить» заодно велит скачать модель
+                // выбранного языка, если её ещё нет.
+                if state.step == .language { state.pickSpeechLang(state.speechLang) }
+                withAnimation(.easeInOut(duration: 0.26)) { state.next() }
             }
         } label: {
             Text(asks == nil ? L("Продолжить", "Continue")
